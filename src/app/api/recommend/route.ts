@@ -9,11 +9,20 @@ interface Rec {
   mediaType: 'book' | 'movie' | 'tv'
 }
 
+const safeJson = async (res: Response) => {
+  try {
+    if (!res.ok) return null
+    const ct = res.headers.get('content-type') || ''
+    if (!ct.includes('application/json')) return null
+    return await res.json()
+  } catch { return null }
+}
+
 export async function GET(req: NextRequest) {
-  /* 1. token → user */
+  /* 1. auth */
   const bearer = req.headers.get('authorization') || ''
   const token  = bearer.startsWith('Bearer ') ? bearer.slice(7) : null
-  if (!token) return NextResponse.json([], { status: 401 })
+  if (!token || token === 'undefined') return NextResponse.json([], { status: 401 })
 
   const supabase = createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -30,61 +39,105 @@ export async function GET(req: NextRequest) {
     .eq('user_id', user.id)
 
   const consumedIds = consumed.map(c => c.media_id)
-
   const recs: Rec[] = []
 
-  /* ── BOOK recommendations ────────────────────────────── */
-  const bookSeeds = consumed.filter(c => c.media_type === 'book').slice(0, 3)
+  /* ── BOOK recs ────────────────────────────────────────── */
+  const bookSeeds = consumed.filter(c => c.media_type === 'book').slice(0, 5)
+  let gotBook = false
+
   for (const seed of bookSeeds) {
-    try {
-      const work = await fetch(`https://openlibrary.org${seed.media_id}.json`).then(r => r.json())
-      const subject = work.subjects?.[0]
-      if (!subject) continue          // try next seed
-      const subj = await fetch(
-        `https://openlibrary.org/subjects/${encodeURIComponent(subject)}.json?limit=8`
-      ).then(r => r.json())
-      subj.works.slice(0, 5).forEach((w: any) => {
-        recs.push({
-          id: w.key,
-          title: w.title,
-          subtitle: w.authors?.[0]?.name,
-          mediaType: 'book',
-        })
-      })
-      break                           // got something → stop looping
-    } catch { /* ignore and try next seed */ }
+    const work = await safeJson(
+      await fetch(`https://openlibrary.org${seed.media_id}.json`)
+    )
+    if (!work) continue
+
+    /* by subject */
+    const subject = work.subjects?.[0]
+    if (subject) {
+      const subj = await safeJson(
+        await fetch(
+          `https://openlibrary.org/subjects/${encodeURIComponent(subject)}.json?limit=8`
+        )
+      )
+      if (subj?.works?.length) {
+        subj.works.slice(0, 5).forEach((w: any) =>
+          recs.push({
+            id: w.key,
+            title: w.title,
+            subtitle: w.authors?.[0]?.name,
+            mediaType: 'book',
+          }),
+        )
+        gotBook = true
+        break
+      }
+    }
+
+    /* fallback by author */
+    const authorKey = work.authors?.[0]?.author?.key
+    if (authorKey) {
+      const a = await safeJson(
+        await fetch(`https://openlibrary.org${authorKey}/works.json?limit=10`)
+      )
+      if (a?.entries?.length) {
+        a.entries.slice(0, 5).forEach((w: any) =>
+          recs.push({
+            id: w.key,
+            title: w.title,
+            subtitle: work.authors?.[0]?.author?.name,
+            mediaType: 'book',
+          }),
+        )
+        gotBook = true
+        break
+      }
+    }
   }
 
-  /* ── MOVIE / TV recommendations ──────────────────────── */
+  /* global fallback subject if still no books */
+  if (!gotBook) {
+    const sf = await safeJson(
+      await fetch('https://openlibrary.org/subjects/science_fiction.json?limit=8')
+    )
+    sf?.works?.slice(0, 5).forEach((w: any) =>
+      recs.push({
+        id: w.key,
+        title: w.title,
+        subtitle: w.authors?.[0]?.name,
+        mediaType: 'book',
+      }),
+    )
+  }
+
+  /* ── MOVIE / TV recs (unchanged) ─────────────────────── */
   const tmdbKey = process.env.NEXT_PUBLIC_TMDB_API_KEY!
   const screenSeeds = consumed.filter(c => c.media_type !== 'book').slice(0, 3)
+
   for (const seed of screenSeeds) {
-    try {
-      const [type, rawId] = seed.media_id.split('_')  // movie_27205
-      const recJson = await fetch(
+    const [type, rawId] = seed.media_id.split('_')
+    const recJson = await safeJson(
+      await fetch(
         `https://api.themoviedb.org/3/${type}/${rawId}/recommendations?api_key=${tmdbKey}&language=en-US&page=1`
-      ).then(r => r.json())
-      if (!recJson.results?.length) continue
-      recJson.results.slice(0, 5).forEach((r: any) => {
-        recs.push({
-          id: `${type}_${r.id}`,
-          title: r.title || r.name,
-          subtitle: (r.release_date || r.first_air_date || '').slice(0, 4),
-          mediaType: type as 'movie' | 'tv',
-        })
-      })
-      break
-    } catch { /* try next seed */ }
+      )
+    )
+    if (!recJson?.results?.length) continue
+    recJson.results.slice(0, 5).forEach((r: any) =>
+      recs.push({
+        id: `${type}_${r.id}`,
+        title: r.title || r.name,
+        subtitle: (r.release_date || r.first_air_date || '').slice(0, 4),
+        mediaType: type as 'movie' | 'tv',
+      }),
+    )
+    break
   }
 
-  /* ── Filter duplicates & consumed ────────────────────── */
+  /* ── filter consumed + dedupe ────────────────────────── */
   const unique = recs
     .filter(r => !consumedIds.includes(r.id))
-    .reduce<Record<string, Rec>>((acc, cur) => {
-      acc[cur.id] = cur
-      return acc
+    .reduce<Record<string, Rec>>((a, c) => {
+      a[c.id] = c
+      return a
     }, {})
-
-  const final = Object.values(unique).slice(0, 10)
-  return NextResponse.json(final)
+  return NextResponse.json(Object.values(unique).slice(0, 10))
 }
