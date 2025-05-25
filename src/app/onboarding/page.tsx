@@ -37,17 +37,27 @@ export default function OnboardingPage() {
   const [consumed, setConsumed] = useState<Suggestion[]>([])
 
   /* ── Load existing rows once ──────────────────────────── */
-  useEffect(() => {
-    if (!userId) return
-    ;(async () => {
-      const { data, error } = await supabase
-        .from('consumed')
-        .select('*')
-        .eq('user_id', userId)
-      if (error) console.error(error)
-      else setConsumed(data as any)
-    })()
-  }, [userId])
+useEffect(() => {
+  if (!userId) return
+  ;(async () => {
+    const { data, error } = await supabase
+      .from('consumed')
+      .select('*')
+      .eq('user_id', userId)
+
+    if (error) console.error(error)
+    else {
+      // map DB → Suggestion
+      const mapped = data.map((r: any) => ({
+        id: r.media_id,
+        title: r.title,
+        subtitle: r.subtitle,
+        mediaType: r.media_type as 'book' | 'movie' | 'tv',
+      }))
+      setConsumed(mapped)
+    }
+  })()
+}, [userId])
 
   /* ── Live search Open Library + TMDB (400 ms debounce) ─ */
   useEffect(() => {
