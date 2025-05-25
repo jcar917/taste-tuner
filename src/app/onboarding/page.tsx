@@ -1,101 +1,121 @@
 'use client'
 
 import { useState, useEffect } from 'react'
+import { useSessionContext } from '@supabase/auth-helpers-react'
+import { useRouter } from 'next/navigation'
+import { supabase } from '@/utils/supabaseClient'
 
 interface Suggestion {
-  id: string          // unique ID (OL work key or TMDB ID)
+  id: string
   title: string
-  subtitle?: string   // author or year etc.
+  subtitle?: string
   mediaType: 'book' | 'movie' | 'tv'
 }
 
-// Read TMDB key that we exposed to the browser
-const TMDB_KEY = process.env.NEXT_PUBLIC_TMDB_API_KEY!
+const iconFor = (m: Suggestion['mediaType']) =>
+  m === 'book' ? '📖' : m === 'movie' ? '🎬' : '📺'
 
 export default function OnboardingPage() {
+  /* ── Supabase auth state ─────────────────────────────── */
+  const { session, isLoading } = useSessionContext()
+  const userId = session?.user.id
+  const router = useRouter()
+
+  /* ─────────────────────────────────────────────────────── */
+  // Redirect rules
+  if (isLoading) {
+    return <p className="p-8 text-center">Loading …</p>
+  }
+  if (!session) {
+    if (typeof window !== 'undefined') router.replace('/login')
+    return null
+  }
+
+  /* ── UI state ─────────────────────────────────────────── */
   const [query, setQuery] = useState('')
   const [suggestions, setSuggestions] = useState<Suggestion[]>([])
   const [consumed, setConsumed] = useState<Suggestion[]>([])
 
-  // ───────────────────────────────────────────────────────────
-  // Live‑search Open Library + TMDB (debounced 400 ms)
+  /* ── Load existing rows once ──────────────────────────── */
   useEffect(() => {
-    if (query.trim().length < 2) {
-      setSuggestions([])
-      return
-    }
+    if (!userId) return
+    ;(async () => {
+      const { data, error } = await supabase
+        .from('consumed')
+        .select('*')
+        .eq('user_id', userId)
+      if (error) console.error(error)
+      else setConsumed(data as any)
+    })()
+  }, [userId])
 
+  /* ── Live search Open Library + TMDB (400 ms debounce) ─ */
+  useEffect(() => {
+    if (query.trim().length < 2) return setSuggestions([])
     const timer = setTimeout(async () => {
       try {
-        const [bookSug, screenSug] = await Promise.all([
+        const [olRaw, tmRaw] = await Promise.all([
           fetch(`https://openlibrary.org/search.json?title=${encodeURIComponent(query)}&limit=5`).then(r => r.json()),
-          fetch(`https://api.themoviedb.org/3/search/multi?api_key=${TMDB_KEY}&query=${encodeURIComponent(query)}&include_adult=false&language=en-US&page=1`).then(r => r.json()),
+          fetch(`https://api.themoviedb.org/3/search/multi?api_key=${process.env.NEXT_PUBLIC_TMDB_API_KEY}&query=${encodeURIComponent(query)}&include_adult=false&language=en-US&page=1`).then(r => r.json()),
         ])
-
-        // Books – map to suggestions
-        const bookPicks: Suggestion[] = (bookSug.docs as any[]).slice(0, 5).map((d) => ({
-          id: d.key as string,                // e.g. "/works/OL123W"
-          title: d.title as string,
+        const books: Suggestion[] = olRaw.docs.slice(0, 5).map((d: any) => ({
+          id: d.key,
+          title: d.title,
           subtitle: d.author_name?.[0],
           mediaType: 'book',
         }))
-
-        // Movies / TV – map & filter non‑viable results
-        const screenPicks: Suggestion[] = (screenSug.results as any[])
-          .filter((r) => r.media_type === 'movie' || r.media_type === 'tv')
+        const screens: Suggestion[] = tmRaw.results
+          .filter((r: any) => ['movie', 'tv'].includes(r.media_type))
           .slice(0, 5)
-          .map((r) => ({
+          .map((r: any) => ({
             id: `${r.media_type}_${r.id}`,
             title: r.title || r.name,
             subtitle: r.release_date?.slice(0, 4) || r.first_air_date?.slice(0, 4),
             mediaType: r.media_type,
           }))
-
-        // Merge & de‑duplicate by id
-        const merged = [...bookPicks, ...screenPicks].filter(
-          (v, i, arr) => arr.findIndex((x) => x.id === v.id) === i,
-        )
-
-        setSuggestions(merged)
+        setSuggestions([...books, ...screens])
       } catch (err) {
         console.error(err)
       }
     }, 400)
-
     return () => clearTimeout(timer)
   }, [query])
 
-  // ───────────────────────────────────────────────────────────
-  function addSuggestion(s: Suggestion) {
-    if (consumed.find((c) => c.id === s.id)) return
+  /* ── Add pick & persist ───────────────────────────────── */
+  async function addSuggestion(s: Suggestion) {
+    if (consumed.find(c => c.id === s.id)) return
     setConsumed([...consumed, s])
     setQuery('')
     setSuggestions([])
+
+    const { error } = await supabase.from('consumed').insert({
+      user_id: userId,
+      media_id: s.id,
+      media_type: s.mediaType,
+      title: s.title,
+      subtitle: s.subtitle,
+    })
+    if (error) console.error(error)
   }
 
-  // Helper for tiny icon
-  const iconFor = (m: Suggestion['mediaType']) =>
-    m === 'book' ? '📖' : m === 'movie' ? '🎬' : '📺'
-
-  // ───────────────────────────────────────────────────────────
+  /* ── Render ───────────────────────────────────────────── */
   return (
     <main className="flex flex-col items-center p-8 max-w-xl mx-auto">
       <h1 className="text-2xl font-bold mb-4 text-center">
         What have you already read or watched?
       </h1>
 
-      {/* Input + dropdown */}
+      {/* Input & dropdown */}
       <div className="relative w-full">
         <input
           value={query}
-          onChange={(e) => setQuery(e.target.value)}
+          onChange={e => setQuery(e.target.value)}
           placeholder="Start typing a title…"
           className="w-full border rounded-lg p-2"
         />
-
         {suggestions.length > 0 && (
-          <ul className="absolute z-10 w-full bg-white border rounded-lg mt-1 max-h-64 overflow-auto shadow-lg">
-            {suggestions.map((s) => (
+          <ul className="absolute z-10 w-full bg-white border rounded-lg mt-1 max-h-60 overflow-auto shadow-lg">
+            {suggestions.map(s => (
               <li
                 key={s.id}
                 onClick={() => addSuggestion(s)}
@@ -104,7 +124,9 @@ export default function OnboardingPage() {
                 <span>{iconFor(s.mediaType)}</span>
                 <span>
                   <span className="font-medium">{s.title}</span>
-                  {s.subtitle && <span className="text-gray-600"> — {s.subtitle}</span>}
+                  {s.subtitle && (
+                    <span className="text-gray-600"> — {s.subtitle}</span>
+                  )}
                 </span>
               </li>
             ))}
@@ -115,7 +137,7 @@ export default function OnboardingPage() {
       {/* Confirmed list */}
       {consumed.length > 0 && (
         <ul className="mt-6 w-full list-disc list-inside space-y-1">
-          {consumed.map((c) => (
+          {consumed.map(c => (
             <li key={c.id} className="text-lg">
               {iconFor(c.mediaType)} {c.title}
               {c.subtitle && <span className="text-gray-600"> — {c.subtitle}</span>}
